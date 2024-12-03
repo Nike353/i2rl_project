@@ -20,7 +20,7 @@ from mujoco import mjx
 from dial_mpc.envs.base_env import BaseEnv, BaseEnvConfig
 from dial_mpc.utils.function_utils import global_to_body_velocity, get_foot_step
 from dial_mpc.utils.io_utils import get_model_path
-
+from dial_mpc.utils.load_traj import MotionProcessor
 
 @dataclass
 class UnitreeGo2EnvConfig(BaseEnvConfig):
@@ -30,7 +30,7 @@ class UnitreeGo2EnvConfig(BaseEnvConfig):
     default_vy: float = 0.0
     default_vyaw: float = 0.0
     ramp_up_time: float = 2.0
-    gait: str = "trot"
+    gait: str = "canter"
 
 
 class UnitreeGo2Env(BaseEnv):
@@ -802,7 +802,193 @@ class UnitreeGo2CrateEnv(UnitreeGo2Env):
         state.info["yaw_tar"] = 0.0
         return state
 
+@dataclass
+class UnitreeGo2TrajectoryEnvConfig(UnitreeGo2EnvConfig):
+    trajectory_file: str = ""
+
+class UnitreeGo2TrajectoryEnv(UnitreeGo2Env):
+    def __init__(self, config: UnitreeGo2TrajectoryEnvConfig):
+        super().__init__(config)
+        self.motion_processor = MotionProcessor()
+        self.motion_processor.load(config.trajectory_file)
+        self.trajectory = self.motion_processor._frames
+        self.pose_target_sequence = self.motion_processor._frames[:, :3]
+        self.quat_target_sequence = self.motion_processor._frames[:, 3:7]
+        self.current_step = 0
+    
+    def reset(self, rng: jax.Array) -> State:
+        rng, key = jax.random.split(rng)
+        pipeline_state = self.pipeline_init(self._init_q, jnp.zeros(self._nv))
+
+        state_info = {
+            "rng": rng,
+            "pos_tar": jnp.array([0.0, 0.0, 0.35]),
+            "vel_tar": jnp.array([0.0, 0.0, 0.0]),
+            "ang_vel_tar": jnp.array([0.0, 0.0, 0.0]),
+            "yaw_tar": 0.0,
+            "step": 0,
+            "z_feet": jnp.zeros(4),
+            "z_feet_tar": jnp.zeros(4),
+            "randomize_target": self._config.randomize_tasks,
+            "last_contact": jnp.zeros(4, dtype=jnp.bool),
+            "feet_air_time": jnp.zeros(4),
+            "last_ctrl": jnp.zeros(12),
+        }
+        # state_info["contact_stage"] = 0
+        # state_info["pose_target_sequence"] = self._pose_target_sequence
+        # state_info["yaw_target_sequence"] = self._yaw_target_sequence
+        
+
+        obs = self._get_obs(pipeline_state, state_info)
+        reward, done = jnp.zeros(2)
+        metrics = {}
+        state = State(pipeline_state, obs, reward, done, metrics, state_info)
+        self.current_step = 0
+        return state
+
+    def step(
+        self, state: State, action: jax.Array
+    ) -> State:  # pytype: disable=signature-mismatch
+        rng, cmd_rng = jax.random.split(state.info["rng"], 2)
+
+        # physics step
+        if self._config.leg_control == "position":
+            ctrl = self.act2joint(action)
+        elif self._config.leg_control == "torque":
+            ctrl = self.act2tau(action, state.pipeline_state)
+        else:
+            raise ValueError("Invalid leg control type.")
+        pipeline_state = self.pipeline_step(state.pipeline_state, ctrl)
+        x, xd = pipeline_state.x, pipeline_state.xd
+
+        # observation data
+        obs = self._get_obs(pipeline_state, state.info)
+
+        # done
+        done = 0.0
+
+        # reward
+        # gaits reward
+        z_feet = pipeline_state.site_xpos[self._feet_site_id][:, 2]
+        duty_ratio, cadence, amplitude = self._gait_params[self._gait]
+        phases = self._gait_phase[self._gait]
+        z_feet_tar = get_foot_step(
+            duty_ratio, cadence, amplitude, phases, state.info["step"] * self.dt
+        )
+        reward_gaits = -jnp.sum(((z_feet_tar - z_feet) / 0.05) ** 2)
+        # position reward
+        
+        # pos_tar = self.pose_target_sequence[state.info["step"]]
+        pos_tar = self.motion_processor.get_frame(state.info["step"])[:3]
+        # adding a bias of 0.1 to the z target
+        # pos_tar = pos_tar.at[2].add(0.1)
+        pos = x.pos[self._torso_idx - 1]
+        reward_pos = -jnp.sum((pos - pos_tar) ** 2)
+        # stay upright reward
+        vec_tar = jnp.array([0.0, 0.0, 1.0])
+        vec = math.rotate(vec_tar, x.rot[0])
+        reward_upright = -jnp.sum(jnp.square(vec - vec_tar))
+        # yaw orientation reward
+        yaw_tar = math.quat_to_euler(self.motion_processor.get_frame(state.info["step"])[3:7])[2]
+        # yaw_tar = math.quat_to_euler(self.quat_target_sequence[state.info["step"]])[2]
+        yaw = math.quat_to_euler(x.rot[self._torso_idx - 1])[2]
+        reward_yaw = -jnp.square(yaw - yaw_tar)
+        # stay to norminal pose reward
+        # reward_pose = -jnp.sum(jnp.square(joint_targets - self._default_pose))
+
+        
+        # energy reward
+        reward_energy = -jnp.sum(
+            jnp.maximum(ctrl * pipeline_state.qvel[6:] / 160.0, 0.0) ** 2
+        )
+        # control rate reward
+        reward_ctrl_rate = -jnp.sum((ctrl - state.info["last_ctrl"]) ** 2)
+        # alive reward
+        reward_alive = 1.0
+        reward_height = -jnp.sum(
+            (x.pos[self._torso_idx - 1, 2] - state.info["pos_tar"][2]) ** 2
+        )
+        reward_height = jnp.exp(-jnp.sum((x.pos[self._torso_idx - 1, 2] - state.info["pos_tar"][2]) ** 2) / 2.5)
+
+        # reward
+        reward = (
+            reward_gaits * 0.1
+            + reward_pos * 0.5
+            + reward_upright * 1.0
+            + reward_yaw * 0.5
+            # + reward_pose * 0.0
+            + reward_energy * 0.000
+            + reward_ctrl_rate * 0.0
+            + reward_alive * 0.0
+            + reward_height * 1.0
+        )
+
+        # done
+        up = jnp.array([0.0, 0.0, 1.0])
+        joint_angles = pipeline_state.q[7:]
+        done = jnp.dot(math.rotate(up, x.rot[self._torso_idx - 1]), up) < 0
+        done |= jnp.any(joint_angles < self.joint_range[:, 0])
+        done |= jnp.any(joint_angles > self.joint_range[:, 1])
+        done |= pipeline_state.x.pos[self._torso_idx - 1, 2] < 0.1
+        done = done.astype(jnp.float32)
+
+        # state management
+        state.info["step"] += 1
+        # if state.info["step"].astype(jnp.int32) >= len(self.trajectory):
+        #     state.info["step"] = 0
+        state.info["rng"] = rng
+        state.info["z_feet"] = z_feet
+        state.info["z_feet_tar"] = z_feet_tar
+        # state.info["contact_stage"] = jnp.minimum(
+        #     jnp.floor(state.info["step"] * self.dt / self._config.jump_dt),
+        #     len(contact_targets) - 1,
+        # ).astype(jnp.int32)
+        state.info["last_ctrl"] = ctrl
+
+        state = state.replace(
+            pipeline_state=pipeline_state, obs=obs, reward=reward, done=done
+        )
+        return state
+
+    def _get_obs(
+        self,
+        pipeline_state: base.State,
+        state_info: dict[str, Any],
+    ) -> jax.Array:
+        x, xd = pipeline_state.x, pipeline_state.xd
+        vb = global_to_body_velocity(
+            xd.vel[self._torso_idx - 1], x.rot[self._torso_idx - 1]
+        )
+        ab = global_to_body_velocity(
+            xd.ang[self._torso_idx - 1] * jnp.pi / 180.0, x.rot[self._torso_idx - 1]
+        )
+        quat = pipeline_state.qpos[3:7]
+        rpy = math.quat_to_euler(quat)
+        pose_target = self.pose_target_sequence[state_info["step"]]
+        yaw_target = math.quat_to_euler(self.quat_target_sequence[state_info["step"]])[2]
+
+        diff_position = x.pos[self._torso_idx - 1] - pose_target
+        diff_yaw = rpy[2] - yaw_target
+        diff_yaw = jnp.arctan2(jnp.sin(diff_yaw), jnp.cos(diff_yaw)).reshape(1)
+        obs = jnp.concatenate(
+            [
+                state_info["vel_tar"],
+                state_info["ang_vel_tar"],
+                state_info["last_ctrl"],
+                diff_position,
+                rpy[:2],
+                diff_yaw,
+                pipeline_state.qpos[7:],
+                vb,
+                ab,
+                pipeline_state.qvel[6:],
+            ]
+        )
+        return obs
+    
+
 
 brax_envs.register_environment("unitree_go2_walk", UnitreeGo2Env)
 brax_envs.register_environment("unitree_go2_seq_jump", UnitreeGo2SeqJumpEnv)
 brax_envs.register_environment("unitree_go2_crate_climb", UnitreeGo2CrateEnv)
+brax_envs.register_environment("unitree_go2_trajectory", UnitreeGo2TrajectoryEnv)

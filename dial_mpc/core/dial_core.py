@@ -3,7 +3,8 @@ import time
 from dataclasses import dataclass
 import importlib
 import sys
-
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "true"
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.25"
 import yaml
 import argparse
 from tqdm import tqdm
@@ -205,15 +206,16 @@ def main():
     else:
         config_dict = yaml.safe_load(open(args.config))
 
+    
     dial_config = load_dataclass_from_dict(DialConfig, config_dict)
     rng = jax.random.PRNGKey(seed=dial_config.seed)
-
+    
     # find env config
     env_config_type = dial_envs.get_config(dial_config.env_name)
     env_config = load_dataclass_from_dict(
         env_config_type, config_dict, convert_list_to_array=True
     )
-
+    
     print(emoji.emojize(":rocket:") + "Creating environment")
     env = brax_envs.get_environment(dial_config.env_name, config=env_config)
     reset_env = jax.jit(env.reset)
