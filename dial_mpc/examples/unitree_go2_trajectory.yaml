@@ -21,4 +21,4 @@ leg_control: torque
 action_scale: 1.0
 
 # Go2
-trajectory_file: "/home/guanqihe/nikhil/i2rl_project/assets/go2_canter.txt"
+trajectory_file: "/home/guanqihe/nikhil/i2rl_project/assets/go2_left turn0.txt"

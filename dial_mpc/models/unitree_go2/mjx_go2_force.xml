@@ -50,7 +50,7 @@
                     <!-- <geom size="0.0175" pos="-0.002 0 -0.213" priority="1" solimp="0.015 1
                     0.031" condim="6" -->
                     <geom type="sphere" size="0.0175" pos="-0.002 0 -0.213" solimp="0.015 1 0.031"
-                        friction="0.6 0.02 0.01" condim="3" />
+                        friction="0.01 0.02 0.01" condim="3" />
                 </default>
             </default>
         </default>

@@ -238,11 +238,13 @@ def main():
     state = state_init
     us = []
     infos = []
+    different_infos=[]
     with tqdm(range(Nstep), desc="Rollout") as pbar:
         for t in pbar:
             # forward single step
             state = step_env(state, Y0[0])
             rollout.append(state.pipeline_state)
+            different_infos.append(state.info)
             rews.append(state.reward)
             us.append(Y0[0])
 
@@ -305,6 +307,7 @@ def main():
     xdata = []
     for i in range(len(rollout)):
         pipeline_state = rollout[i]
+        info = different_infos[i]
         data.append(
             jnp.concatenate(
                 [
@@ -312,6 +315,8 @@ def main():
                     pipeline_state.qpos,
                     pipeline_state.qvel,
                     pipeline_state.ctrl,
+                    info['pos_tar'],
+                    jnp.array([info['yaw_tar']]),
                 ]
             )
         )

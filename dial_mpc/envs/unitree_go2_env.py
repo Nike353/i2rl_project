@@ -30,7 +30,7 @@ class UnitreeGo2EnvConfig(BaseEnvConfig):
     default_vy: float = 0.0
     default_vyaw: float = 0.0
     ramp_up_time: float = 2.0
-    gait: str = "canter"
+    gait: str = "trot"
 
 
 class UnitreeGo2Env(BaseEnv):
@@ -861,6 +861,9 @@ class UnitreeGo2TrajectoryEnv(UnitreeGo2Env):
         pipeline_state = self.pipeline_step(state.pipeline_state, ctrl)
         x, xd = pipeline_state.x, pipeline_state.xd
 
+
+        state.info['pos_tar'] = self.motion_processor.get_frame(state.info["step"])[:3]
+        state.info['yaw_tar'] = -self.motion_processor.get_frame_yaw(state.info["step"]) +self.motion_processor.get_frame_yaw(0) +3.14
         # observation data
         obs = self._get_obs(pipeline_state, state.info)
 
@@ -879,7 +882,7 @@ class UnitreeGo2TrajectoryEnv(UnitreeGo2Env):
         # position reward
         
         # pos_tar = self.pose_target_sequence[state.info["step"]]
-        pos_tar = self.motion_processor.get_frame(state.info["step"])[:3]
+        pos_tar = state.info['pos_tar']
         # adding a bias of 0.1 to the z target
         # pos_tar = pos_tar.at[2].add(0.1)
         pos = x.pos[self._torso_idx - 1]
@@ -889,8 +892,8 @@ class UnitreeGo2TrajectoryEnv(UnitreeGo2Env):
         vec = math.rotate(vec_tar, x.rot[0])
         reward_upright = -jnp.sum(jnp.square(vec - vec_tar))
         # yaw orientation reward
-        yaw_tar = math.quat_to_euler(self.motion_processor.get_frame(state.info["step"])[3:7])[2]
-        # yaw_tar = math.quat_to_euler(self.quat_target_sequence[state.info["step"]])[2]
+        yaw_tar = state.info['yaw_tar']
+            # yaw_tar = math.quat_to_euler(self.quat_target_sequence[state.info["step"]])[2]
         yaw = math.quat_to_euler(x.rot[self._torso_idx - 1])[2]
         reward_yaw = -jnp.square(yaw - yaw_tar)
         # stay to norminal pose reward
@@ -912,14 +915,11 @@ class UnitreeGo2TrajectoryEnv(UnitreeGo2Env):
 
         # reward
         reward = (
-            reward_gaits * 0.1
+            reward_gaits * 0.4
             + reward_pos * 0.5
             + reward_upright * 1.0
             + reward_yaw * 0.5
-            # + reward_pose * 0.0
-            + reward_energy * 0.000
-            + reward_ctrl_rate * 0.0
-            + reward_alive * 0.0
+            + reward_ctrl_rate * 0.1
             + reward_height * 1.0
         )
 
@@ -939,6 +939,7 @@ class UnitreeGo2TrajectoryEnv(UnitreeGo2Env):
         state.info["rng"] = rng
         state.info["z_feet"] = z_feet
         state.info["z_feet_tar"] = z_feet_tar
+
         # state.info["contact_stage"] = jnp.minimum(
         #     jnp.floor(state.info["step"] * self.dt / self._config.jump_dt),
         #     len(contact_targets) - 1,
@@ -964,9 +965,8 @@ class UnitreeGo2TrajectoryEnv(UnitreeGo2Env):
         )
         quat = pipeline_state.qpos[3:7]
         rpy = math.quat_to_euler(quat)
-        pose_target = self.pose_target_sequence[state_info["step"]]
-        yaw_target = math.quat_to_euler(self.quat_target_sequence[state_info["step"]])[2]
-
+        pose_target = state_info['pos_tar']
+        yaw_target = state_info['yaw_tar']
         diff_position = x.pos[self._torso_idx - 1] - pose_target
         diff_yaw = rpy[2] - yaw_target
         diff_yaw = jnp.arctan2(jnp.sin(diff_yaw), jnp.cos(diff_yaw)).reshape(1)

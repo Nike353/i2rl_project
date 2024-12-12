@@ -43,6 +43,8 @@ class MotionProcessor:
         self.num_frames = self._frames.shape[0]
         self.cycle_delta_pos = self._calc_cycle_delta_pos()
         self.cycle_delta_rot = self._calc_cycle_delta_rot()
+        print(self.cycle_delta_pos)
+        print(self.cycle_delta_rot)
 
     def _postprocess_frames(self, frames):
         """Postprocess frames using JAX."""
@@ -72,8 +74,8 @@ class MotionProcessor:
     def get_frame(self, step_idx):
         frame_idx = step_idx % self.num_frames
         cycle_count = step_idx // self.num_frames
-        cycle_offset_pos = self._calc_cycle_offset_pos(cycle_count)
-        cycle_offset_rot = self._calc_cycle_offset_rot(cycle_count)
+        # cycle_offset_pos = self._calc_cycle_offset_pos(cycle_count)
+        # cycle_offset_rot = self._calc_cycle_offset_rot(cycle_count)
 
         frame = self._frames[frame_idx]
         cycle_offset_pos = self._calc_cycle_offset_pos(cycle_count)
@@ -82,17 +84,21 @@ class MotionProcessor:
         # Get the root position and rotation of the frame
         root_pos = self.get_frame_root_pos(frame)
         root_rot = self.get_frame_root_rot(frame)
-
-        root_pos = self.quaternion_rotate_point(root_pos, cycle_offset_rot) + cycle_offset_pos
+        root_pos = root_pos+cycle_offset_pos#+self.quaternion_rotate_point(root_pos, cycle_offset_rot)
+        root_pos = root_pos.at[1].set(0)
         root_rot = self.quaternion_multiply(root_rot, cycle_offset_rot)
 
-        # exchnage x and y in root_pos
-        # temp = root_pos[0]  
-        # root_pos = root_pos.at[0].set(root_pos[1])
-        # root_pos = root_pos.at[1].set(temp)
         frame = self.set_frame_root_pos(root_pos, frame)
         frame = self.set_frame_root_rot(root_rot, frame)
         return frame
+    
+    def get_frame_yaw(self, step_idx):
+        frame_idx = step_idx % self.num_frames
+        cycle_count = step_idx // self.num_frames
+        cycle_offset_yaw = self._calc_cycle_offset_yaw(cycle_count)
+        frame = self._frames[frame_idx]
+        root_yaw = self.get_frame_root_yaw(frame)
+        return root_yaw + cycle_offset_yaw
 
     def _calc_cycle_delta_pos(self):
         """
@@ -160,7 +166,7 @@ class MotionProcessor:
             return jax.lax.fori_loop(0, num_cycles, update_offset, jnp.zeros(3))
 
         rotational_offset = compute_rotational_offset(num_cycles)
-        return no_rotation_offset
+        # return no_rotation_offset
         # Combine cases using jax.lax.cond
         return jax.lax.cond(
             self._enable_cycle_offset_pos,
@@ -201,6 +207,8 @@ class MotionProcessor:
         # cycle_offset_rot = compute_rotation(None)
         return cycle_offset_rot
 
+    def _calc_cycle_offset_yaw(self, num_cycles):
+        return num_cycles * self.cycle_delta_rot
 
     @staticmethod
     def quaternion_multiply(quat1, quat2):
@@ -269,9 +277,13 @@ class MotionProcessor:
         """Normalize and standardize quaternion."""
         q = q / jnp.linalg.norm(q)
         # print(q)
-        # if q[0] < 0:
-        #     q = -q  # Standardize quaternion
-        return q
+        q_standardized = jax.lax.cond(
+        q[0] < 0,         # Condition: If the scalar part is negative
+        lambda q: -q,     # Negate the quaternion
+        lambda q: q,      # Return the quaternion as is
+        q                 # The input quaternion
+        )
+        return q_standardized
 
     @staticmethod
     def get_frame_root_pos(frame):
@@ -288,6 +300,11 @@ class MotionProcessor:
     def get_frame_root_rot(frame):
         """Extract root rotation (quaternion) from a frame."""
         return frame[3:7]
+
+    def get_frame_root_yaw(self, frame):
+        """Extract root yaw from a frame."""
+        root_rot = self.get_frame_root_rot(frame)
+        return self.calc_heading(root_rot)
 
     @staticmethod
     def set_frame_root_rot(rot, frame):
